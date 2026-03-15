@@ -24,7 +24,7 @@ from numba import njit
 from ..models import sonata
 
 #################################
-sys.path.append("../P3-SAM")
+sys.path.append(str(Path(__file__).resolve().parents[3] / "P3-SAM"))
 from model import build_P3SAM, load_state_dict
 
 
@@ -804,8 +804,8 @@ def mesh_sam(
     model,
     mesh,
     save_path,
-    point_num=100000,
-    prompt_num=400,
+    point_num=50000,    # lowvram: 100000 → 50000
+    prompt_num=200,     # lowvram: 400 → 200
     save_mid_res=False,
     show_info=False,
     post_process=False,
@@ -821,8 +821,6 @@ def mesh_sam(
     if show_info:
         print(f"点数：{mesh.vertices.shape[0]} 面片数：{mesh.faces.shape[0]}")
 
-    point_num = 100000
-    prompt_num = 400
     with Timer("获取邻接面片"):
         # 获取邻接面片
         face_adjacency = mesh.face_adjacency
@@ -848,6 +846,10 @@ def mesh_sam(
 
     with Timer("获取特征"):
         _feats = get_feat(model, _points, normals)
+    # Offload Sonata encoder to CPU to free VRAM; _feats stays on GPU
+    model.cpu()
+    model_parallel.cpu()
+    torch.cuda.empty_cache()
     if show_info:
         print("预处理特征")
 
@@ -879,8 +881,11 @@ def mesh_sam(
     if show_info:
         print("采样完成")
 
+    # Move mask decoder back to GPU for inference
+    model.cuda()
+    model_parallel.cuda()
     with Timer("推理"):
-        bs = 64
+        bs = 8  # lowvram: 64 → 8 (reduces [N,K,512] peak activation by 8×)
         step_num = prompt_num // bs + 1
         mask_res = []
         iou_res = []
@@ -1362,7 +1367,12 @@ class AutoMask:
         self.model = YSAM()
         self.model.load_state_dict(ckpt_path)
         self.model.eval()
-        self.model_parallel = torch.nn.DataParallel(self.model)
+        # Only use DataParallel when multiple GPUs are available; on a single GPU
+        # DataParallel adds overhead without benefit.
+        if torch.cuda.device_count() > 1:
+            self.model_parallel = torch.nn.DataParallel(self.model)
+        else:
+            self.model_parallel = self.model  # lowvram: skip DataParallel
         self.model.cuda()
         self.model_parallel.cuda()
         self.point_num = point_num

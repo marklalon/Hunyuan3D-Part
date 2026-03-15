@@ -62,7 +62,7 @@ def run_infer(mesh_file_name, seed):
     additional_params = {"output_type": "trimesh"}
     obj_mesh, (out_bbox, mesh_gt_bbox, explode_object) = _PIPELINE(
         mesh_path=mesh_file_name,
-        octree_resolution=512,
+        octree_resolution=256,   # lowvram: 512 → 256
         **additional_params,
     )
     # Export all results to temporary files for Gradio Model3D

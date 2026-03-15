@@ -312,7 +312,17 @@ class PartFormerPipeline(TokenAllocMixin):
         return extra_step_kwargs
 
     def predict_bbox(
-        self, mesh: trimesh.Trimesh, scale_box=1.0, drop_normal=True, seed=42
+        self,
+        mesh: trimesh.Trimesh,
+        scale_box=1.0,
+        drop_normal=True,
+        seed=42,
+        point_num=None,
+        prompt_num=None,
+        threshold=None,
+        post_process=True,
+        show_info=True,
+        clean_mesh_flag=True,
     ):
         """
         Predict the bounding box of the object surface.
@@ -324,7 +334,14 @@ class PartFormerPipeline(TokenAllocMixin):
         if self.bbox_predictor is None:
             raise ValueError("bbox_predictor is not set.")
         aabb, face_ids, mesh = self.bbox_predictor.predict_aabb(
-            mesh, post_process=True, seed=seed
+            mesh,
+            point_num=point_num,
+            prompt_num=prompt_num,
+            threshold=threshold,
+            post_process=post_process,
+            show_info=show_info,
+            clean_mesh_flag=clean_mesh_flag,
+            seed=seed,
         )
         # aabb, face_ids, mesh = self.bbox_predictor.predict_aabb(mesh, post_process=False)
         aabb = torch.from_numpy(aabb)
@@ -359,9 +376,27 @@ class PartFormerPipeline(TokenAllocMixin):
         part_surface_inbbox,
         object_surface,
         do_classifier_free_guidance,
+        cond_chunk_size=2,
     ):
-        bsz = object_surface.shape[0]
-        cond = self.conditioner(part_surface_inbbox, object_surface)
+        num_parts = part_surface_inbbox.shape[0]
+        # Chunk conditioner forward to avoid OOM with many parts
+        chunks = []
+        for start in range(0, num_parts, cond_chunk_size):
+            end = min(start + cond_chunk_size, num_parts)
+            chunk_cond = self.conditioner(
+                part_surface_inbbox[start:end],
+                object_surface[start:end],
+            )
+            # Move chunk results to CPU immediately to free activations
+            chunks.append({k: v.cpu() for k, v in chunk_cond.items()})
+            torch.cuda.empty_cache()
+        # Merge chunks back to GPU
+        cond = {
+            k: torch.cat([c[k] for c in chunks], dim=0).to(
+                device=self.device, dtype=self.dtype
+            )
+            for k in chunks[0]
+        }
 
         if do_classifier_free_guidance:
             # TODO: do_classifier_free_guidance, un_cond
@@ -398,6 +433,12 @@ class PartFormerPipeline(TokenAllocMixin):
         aabb=None,
         part_surface_inbbox=None,
         seed=42,
+        point_num=None,
+        prompt_num=None,
+        bbox_threshold=None,
+        bbox_post_process=True,
+        bbox_show_info=True,
+        bbox_clean_mesh_flag=True,
     ):
         """
         Check the inputs of the pipeline.
@@ -443,7 +484,7 @@ class PartFormerPipeline(TokenAllocMixin):
                 rng,
                 obj_surface_raw["random_surface"],
                 obj_surface_raw["sharp_surface"],
-                pc_size=81920,
+                pc_size=81920,        # required by conditioner encoder architecture
                 pc_sharpedge_size=0,
                 return_sharpedge_label=True,
                 return_normal=True,
@@ -451,7 +492,16 @@ class PartFormerPipeline(TokenAllocMixin):
             obj_surface = obj_surface.unsqueeze(0)
         # 2. load aabb
         if aabb is None:
-            aabb = self.predict_bbox(mesh, seed=seed)
+            aabb = self.predict_bbox(
+                mesh,
+                seed=seed,
+                point_num=point_num,
+                prompt_num=prompt_num,
+                threshold=bbox_threshold,
+                post_process=bbox_post_process,
+                show_info=bbox_show_info,
+                clean_mesh_flag=bbox_clean_mesh_flag,
+            )
             print(f"Get bbox from bbox_predictor: {aabb.shape}")
         else:
             if isinstance(aabb, np.ndarray):
@@ -463,7 +513,7 @@ class PartFormerPipeline(TokenAllocMixin):
         # 3. load part surface in bbox
         if part_surface_inbbox is None:
             part_surface_inbbox, valid_parts_mask = sample_bbox_points_from_trimesh(
-                mesh, aabb, num_points=81920, seed=seed
+                mesh, aabb, num_points=81920, seed=seed  # required by conditioner encoder
             )
             aabb = aabb[valid_parts_mask]
             aabb = aabb.unsqueeze(0)
@@ -562,11 +612,18 @@ class PartFormerPipeline(TokenAllocMixin):
         seed=42,
         # marching cubes
         box_v=1.01,
-        octree_resolution=512,
+        octree_resolution=256,   # lowvram: 512 → 256 (8× less grid memory)
         mc_level=-1 / 512,
-        num_chunks=400000,
+        num_chunks=20000,         # lowvram: 400000 → 20000 (smaller MC batches)
         mc_algo="mc",
         output_type: Optional[str] = "trimesh",
+        cond_chunk_size: int = 2,
+        point_num: Optional[int] = None,
+        prompt_num: Optional[int] = None,
+        bbox_threshold: Optional[float] = None,
+        bbox_post_process: bool = True,
+        bbox_show_info: bool = True,
+        bbox_clean_mesh_flag: bool = True,
         enable_pbar=True,
         **kwargs,
     ):
@@ -594,6 +651,12 @@ class PartFormerPipeline(TokenAllocMixin):
             aabb,
             part_surface_inbbox,
             seed=seed,
+            point_num=point_num,
+            prompt_num=prompt_num,
+            bbox_threshold=bbox_threshold,
+            bbox_post_process=bbox_post_process,
+            bbox_show_info=bbox_show_info,
+            bbox_clean_mesh_flag=bbox_clean_mesh_flag,
         )
         if self.verbose:
             # return gt mesh with bbox
@@ -610,6 +673,10 @@ class PartFormerPipeline(TokenAllocMixin):
                 box.vertices *= (bbox[1] - bbox[0]).float().cpu().numpy()
                 box.vertices += (bbox[0] + bbox[1]).float().cpu().numpy() / 2
                 mesh_bbox.add_geometry(box)
+        # Offload bbox predictor: bboxes are already computed
+        if self.bbox_predictor is not None:
+            self.bbox_predictor.model.cpu()
+            torch.cuda.empty_cache()
         #  Convert to device and dtype
         obj_surface = obj_surface.to(device=device, dtype=dtype)
         aabb = aabb.to(device=device, dtype=dtype)
@@ -628,12 +695,20 @@ class PartFormerPipeline(TokenAllocMixin):
             num_parts, latent_shape, dtype, device, generator
         )
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # Offload DiT + VAE before conditioner encoding to free VRAM
+        self.model.cpu()
+        self.vae.cpu()
+        torch.cuda.empty_cache()
         # 3. condition
         cond = self.encode_cond(
             part_surface_inbbox.reshape(batch_size * num_parts, N, dim),
             obj_surface.expand(batch_size * num_parts, -1, -1),
             do_classifier_free_guidance,
+            cond_chunk_size=cond_chunk_size,
         )
+        # Offload conditioner after encoding
+        self.conditioner.cpu()
+        torch.cuda.empty_cache()
         # 4. guidance_cond for controling sampling
         guidance_cond = None
         if getattr(self.model, "guidance_cond_proj_dim", None) is not None:
@@ -654,6 +729,9 @@ class PartFormerPipeline(TokenAllocMixin):
         )
 
         torch.cuda.empty_cache()
+
+        # Move DiT model back to GPU for denoising
+        self.model.to(device=device, dtype=dtype)
 
         # 6. Denoising loop
         with synchronize_timer("Diffusion Sampling"):
@@ -693,6 +771,10 @@ class PartFormerPipeline(TokenAllocMixin):
                     step_idx = i // getattr(self.scheduler, "order", 1)
                     callback(step_idx, t, outputs)
 
+        # Offload diffusion transformer before VAE decode
+        self.model.cpu()
+        self.vae.to(device=device, dtype=dtype)  # Move VAE back to GPU for decode
+        torch.cuda.empty_cache()
         # latents2mesh
         # part_latents = torch.split(latents, num_tokens[0].tolist(), dim=1)
         out = trimesh.Scene()

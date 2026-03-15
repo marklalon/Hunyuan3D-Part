@@ -38,6 +38,11 @@ Generating 3D shapes at part level is pivotal for downstream applications such a
     python demo.py --config partgen/config/infer.yaml --mesh_path ./data/test.glb --save_dir ./results/
     ```
 
+  Low-VRAM example (recommended on 16GB GPU):
+  ```
+  python demo.py --mesh_path ./data/test.glb --save_dir ./results/ --num_inference_steps 50 --octree_resolution 256 --num_chunks 20000 --cond_chunk_size 2 --point_num 50000 --prompt_num 200
+  ```
+
 
 
 ### Citation
