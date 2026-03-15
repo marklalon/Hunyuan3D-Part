@@ -97,6 +97,7 @@ import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
 import json
+from pathlib import Path
 
 try:
     import flash_attn
@@ -112,6 +113,10 @@ MODELS = [
     "sonata_small",
     "sonata_linear_prob_head_sc",
 ]
+
+
+def get_sonata_checkpoint_dir() -> str:
+    return os.fspath(Path(__file__).resolve().parents[4] / "models" / "sonata" / "ckpt")
 
 
 class LayerScale(nn.Module):
@@ -836,7 +841,7 @@ def load(
             filename=f"{name}.pth",
             repo_type="model",
             revision="main",
-            local_dir=download_root or os.path.expanduser("~/.cache/sonata/ckpt"),
+            local_dir=download_root or get_sonata_checkpoint_dir(),
         )
     elif os.path.isfile(name):
         print(f"Loading checkpoint in local path: {name} ...")

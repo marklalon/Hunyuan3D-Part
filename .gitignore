@@ -1,0 +1,13 @@
+__pycache__
+models/
+.venv
+.vs/*
+*.whl
+
+# Claude AI
+.claude/
+*.egg
+
+# IDE
+.idea/
+.vscode/
